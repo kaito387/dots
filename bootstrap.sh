@@ -1,145 +1,241 @@
 #!/usr/bin/env bash
-# bootstrap.sh — set up kaito387/dots on a fresh machine
-# Usage: bash bootstrap.sh
-
+# bootstrap.sh — bootstrap for Kaito387/dots
 set -euo pipefail
 
-DOTS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-
-info()    { printf '\e[1;34m==> %s\e[0m\n' "$*"; }
-success() { printf '\e[1;32m  ✓ %s\e[0m\n' "$*"; }
-warn()    { printf '\e[1;33m  ! %s\e[0m\n' "$*"; }
-die()     { printf '\e[1;31mERROR: %s\e[0m\n' "$*" >&2; exit 1; }
-
-# Back up a file/dir and replace it with a symlink.
-# link_file <source> <target>
-link_file() {
-    local src="$1" dst="$2"
-    if [[ -L "$dst" && "$(readlink "$dst")" == "$src" ]]; then
-        success "already linked: $dst"
-        return
-    fi
-    if [[ -e "$dst" || -L "$dst" ]]; then
-        local backup="${dst}.bak.$(date +%Y%m%d%H%M%S)"
-        warn "backing up $dst → $backup"
-        mv "$dst" "$backup"
-    fi
-    mkdir -p "$(dirname "$dst")"
-    ln -sf "$src" "$dst"
-    success "linked: $dst → $src"
-}
-
-# ── OS detection ──────────────────────────────────────────────────────────────
-
-OS="$(uname -s)"
-case "$OS" in
-    Linux)  PLATFORM=linux ;;
-    Darwin) PLATFORM=macos ;;
-    *)      die "Unsupported OS: $OS" ;;
-esac
-
-# ── dependency checks ─────────────────────────────────────────────────────────
+# ── pretty logs ───────────────────────────────────────────────────────────────
+info()    { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
+success() { printf '\033[1;32m[OK]\033[0m    %s\n' "$*"; }
+warn()    { printf '\033[1;33m[WARN]\033[0m  %s\n' "$*"; }
+error()   { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 
 need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed. Install it and re-run."
+  command -v "$1" &>/dev/null
 }
 
-need_cmd git
-need_cmd zsh
-need_cmd tmux
+# ── symlink helper (backup existing) ─────────────────────────────────────────
+link() {
+  local src="$1"
+  local dst="$2"
 
-# ── Oh My Zsh ─────────────────────────────────────────────────────────────────
+  mkdir -p "$(dirname "$dst")"
 
-info "Oh My Zsh"
-if [[ -d "$HOME/.oh-my-zsh" ]]; then
-    success "already installed"
-else
-    RUNZSH=no CHSH=no sh -c \
-        "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
-    success "installed"
-fi
-
-ZSH_CUSTOM="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
-
-# ── Powerlevel10k ─────────────────────────────────────────────────────────────
-
-info "Powerlevel10k theme"
-P10K_DIR="$ZSH_CUSTOM/themes/powerlevel10k"
-if [[ -d "$P10K_DIR" ]]; then
-    success "already installed"
-else
-    git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$P10K_DIR"
-    success "installed"
-fi
-
-# ── zsh plugins ───────────────────────────────────────────────────────────────
-
-install_plugin() {
-    local name="$1" url="$2"
-    local dir="$ZSH_CUSTOM/plugins/$name"
-    info "plugin: $name"
-    if [[ -d "$dir" ]]; then
-        success "already installed"
-    else
-        git clone --depth=1 "$url" "$dir"
-        success "installed"
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    # already points to src -> skip
+    if [ "$(readlink -f "$dst" 2>/dev/null || true)" = "$(readlink -f "$src")" ]; then
+      success "Already linked: $dst"
+      return
     fi
+    warn "Backing up existing: $dst -> ${dst}.bak"
+    mv "$dst" "${dst}.bak"
+  fi
+
+  ln -s "$src" "$dst"
+  success "Linked: $dst -> $src"
 }
 
-install_plugin zsh-syntax-highlighting \
-    https://github.com/zsh-users/zsh-syntax-highlighting.git
-install_plugin zsh-autosuggestions \
-    https://github.com/zsh-users/zsh-autosuggestions.git
+# ── package install wrappers ─────────────────────────────────────────────────
+install_pkg() {
+  # usage: install_pkg <apt|pacman|brew> <package>
+  local pkg="$1"
 
-# ── optional tools ────────────────────────────────────────────────────────────
+  if need_cmd apt-get; then
+    sudo apt-get update -y
+    sudo apt-get install -y "$pkg"
+    return
+  fi
 
-info "Optional tools"
+  if need_cmd pacman; then
+    sudo pacman -S --noconfirm --needed "$pkg"
+    return
+  fi
 
-if command -v eza >/dev/null 2>&1; then
-    success "eza: already installed"
-else
-    warn "eza not found — install it for 'ls' aliases (https://github.com/eza-community/eza)"
-fi
+  if need_cmd brew; then
+    brew install "$pkg"
+    return
+  fi
 
-if command -v zoxide >/dev/null 2>&1; then
-    success "zoxide: already installed"
-else
-    warn "zoxide not found — install it for the 'cd' alias (https://github.com/ajeetdsouza/zoxide)"
-fi
+  return 1
+}
 
-# ── symlink dotfiles ──────────────────────────────────────────────────────────
+# ── installers ───────────────────────────────────────────────────────────────
+install_zsh() {
+  info "Checking zsh..."
+  if ! need_cmd zsh; then
+    info "Installing zsh..."
+    install_pkg zsh || { error "Cannot auto-install zsh. Please install it manually."; exit 1; }
+  fi
+  success "zsh: $(zsh --version)"
+}
 
-info "Symlinking dotfiles"
-link_file "$DOTS/zsh/zshrc"              "$HOME/.zshrc"
-link_file "$DOTS/tmux/tmux.conf"         "$HOME/.tmux.conf"
-link_file "$DOTS/tmux/clipboard-copy.sh" "$HOME/.tmux/clipboard-copy.sh"
-chmod +x "$DOTS/tmux/clipboard-copy.sh"
+install_tmux() {
+  info "Checking tmux..."
+  if ! need_cmd tmux; then
+    info "Installing tmux..."
+    install_pkg tmux || { error "Cannot auto-install tmux. Please install it manually."; exit 1; }
+  fi
+  success "tmux: $(tmux -V)"
+}
 
-# ── export DOTS in ~/.zshenv ──────────────────────────────────────────────────
+install_omz() {
+  info "Checking Oh My Zsh..."
+  if [ -d "$HOME/.oh-my-zsh" ]; then
+    success "Oh My Zsh already installed."
+    return
+  fi
 
-info "Exporting DOTS in ~/.zshenv"
-ZSHENV="$HOME/.zshenv"
-if grep -qF "export DOTS=" "$ZSHENV" 2>/dev/null; then
-    # Update existing line
-    sed -i.bak "s|export DOTS=.*|export DOTS=\"$DOTS\"|" "$ZSHENV"
-    success "updated DOTS in $ZSHENV"
-else
-    printf '\nexport DOTS="%s"\n' "$DOTS" >> "$ZSHENV"
-    success "added DOTS to $ZSHENV"
-fi
+  info "Installing Oh My Zsh..."
+  RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+  success "Oh My Zsh installed."
+}
 
-# ── make scripts executable ───────────────────────────────────────────────────
+install_p10k() {
+  local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
+  info "Checking Powerlevel10k..."
+  if [ -d "$dir" ]; then
+    success "Powerlevel10k already installed."
+    return
+  fi
+  info "Installing Powerlevel10k..."
+  git clone --depth=1 https://github.com/romkatv/powerlevel10k.git "$dir"
+  success "Powerlevel10k installed."
+}
 
-info "Making scripts executable"
-chmod +x "$DOTS/tmux/acm.sh"
-chmod +x "$DOTS/tmux/clipboard-copy.sh"
-success "tmux/acm.sh, tmux/clipboard-copy.sh"
+install_zsh_plugin() {
+  # usage: install_zsh_plugin <name> <git_url>
+  local name="$1"
+  local url="$2"
+  local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/$name"
 
-# ── done ──────────────────────────────────────────────────────────────────────
+  info "Checking plugin $name..."
+  if [ -d "$dir" ]; then
+    success "$name already installed."
+    return
+  fi
 
-printf '\n\e[1;32mBootstrap complete!\e[0m\n'
-echo "  • Start a new zsh session (or run: exec zsh) to apply changes."
-echo "  • Run 'p10k configure' to set up your prompt."
-echo "  • Use '$DOTS/tmux/acm.sh' to launch the ACM tmux session."
+  info "Installing plugin $name..."
+  git clone --depth=1 "$url" "$dir"
+  success "$name installed."
+}
+
+install_zoxide() {
+  info "Checking zoxide..."
+  if need_cmd zoxide; then
+    success "zoxide: $(zoxide --version)"
+    return
+  fi
+
+  info "Installing zoxide..."
+  if install_pkg zoxide; then
+    success "zoxide: $(zoxide --version)"
+    return
+  fi
+
+  warn "Package manager install failed; using upstream install script..."
+  curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh
+  if ! need_cmd zoxide; then
+    error "zoxide install script finished but zoxide isn't in PATH yet."
+    error "Try restarting your shell, or ensure ~/.local/bin is on PATH."
+    exit 1
+  fi
+  success "zoxide: $(zoxide --version)"
+}
+
+install_eza() {
+  info "Checking eza..."
+  if need_cmd eza; then
+    success "eza: $(eza --version | head -n1)"
+    return
+  fi
+
+  info "Installing eza..."
+
+  if need_cmd apt-get; then
+    # Debian/Ubuntu: use gierens repo
+    sudo apt-get update -y
+    sudo apt-get install -y gpg wget
+
+    sudo mkdir -p /etc/apt/keyrings
+    wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc \
+      | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
+
+    echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" \
+      | sudo tee /etc/apt/sources.list.d/gierens.list >/dev/null
+
+    sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
+
+    sudo apt-get update -y
+    sudo apt-get install -y eza
+  elif need_cmd pacman; then
+    sudo pacman -S --noconfirm --needed eza
+  elif need_cmd brew; then
+    brew install eza
+  elif need_cmd cargo; then
+    warn "No system package manager detected; installing eza with cargo..."
+    cargo install eza
+  else
+    error "Cannot auto-install eza. See https://github.com/eza-community/eza/blob/main/INSTALL.md"
+    exit 1
+  fi
+
+  success "eza: $(eza --version | head -n1)"
+}
+
+# ── deploy dotfiles ──────────────────────────────────────────────────────────
+deploy_configs() {
+  info "Deploying configs (symlinks)..."
+
+  link "$DOTFILES_DIR/zsh/zshrc"      "$HOME/.zshrc"
+  link "$DOTFILES_DIR/zsh/p10k.zsh"   "$HOME/.p10k.zsh"
+  link "$DOTFILES_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
+
+  success "Configs deployed."
+}
+
+set_default_shell_to_zsh() {
+  local zsh_path
+  zsh_path="$(command -v zsh)"
+
+  if [ "${SHELL:-}" = "$zsh_path" ]; then
+    success "Default shell already zsh."
+    return
+  fi
+
+  info "Changing default shell to zsh (requires password)..."
+  chsh -s "$zsh_path" || warn "chsh failed. You may need to run it manually: chsh -s $zsh_path"
+  success "Default shell set to zsh (effective after re-login)."
+}
+
+main() {
+  info "====== bootstrap Kaito387/dots ======"
+
+  # basic tools for cloning/install scripts
+  if ! need_cmd git; then
+    error "git is required. Please install git first."
+    exit 1
+  fi
+  if ! need_cmd curl; then
+    error "curl is required. Please install curl first."
+    exit 1
+  fi
+
+  install_zsh
+  install_tmux
+  install_omz
+
+  install_p10k
+  install_zsh_plugin zsh-syntax-highlighting https://github.com/zsh-users/zsh-syntax-highlighting.git
+  install_zsh_plugin zsh-autosuggestions https://github.com/zsh-users/zsh-autosuggestions.git
+
+  install_zoxide
+  install_eza
+
+  deploy_configs
+  set_default_shell_to_zsh
+
+  echo ""
+  success "Done. Run: exec zsh"
+}
+
+main "$@"
