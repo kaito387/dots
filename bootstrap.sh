@@ -3,6 +3,9 @@
 set -euo pipefail
 
 DOTFILES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARGET_HOME="$HOME"
+CONFIG_SOURCES=(zsh/zshrc zsh/p10k.zsh tmux/tmux.conf tmux/clipboard-copy.sh)
+CONFIG_TARGETS=(.zshrc .p10k.zsh .tmux.conf .tmux/clipboard-copy.sh)
 
 # ── pretty logs ───────────────────────────────────────────────────────────────
 info()    { printf '\033[1;34m[INFO]\033[0m  %s\n' "$*"; }
@@ -18,30 +21,40 @@ need_cmd() {
 link() {
   local src="$1"
   local dst="$2"
+  local backup=""
 
-  mkdir -p "$(dirname "$dst")"
+  [ -f "$src" ] || { error "Missing source: $src"; return 1; }
+
+  mkdir -p "$(dirname "$dst")" || return $?
 
   if [ -e "$dst" ] || [ -L "$dst" ]; then
     # already points to src -> skip
-    if [ "$(readlink -f "$dst" 2>/dev/null || true)" = "$(readlink -f "$src")" ]; then
+    if [ -L "$dst" ] && [ "$dst" -ef "$src" ]; then
       success "Already linked: $dst"
       return
     fi
-    warn "Backing up existing: $dst -> ${dst}.bak"
-    mv "$dst" "${dst}.bak"
+    backup="$(mktemp -d "${dst}.backup.XXXXXXXX")" || return $?
+    warn "Backing up existing: $dst -> $backup/original"
+    mv "$dst" "$backup/original" || return $?
   fi
 
-  ln -s "$src" "$dst"
+  if ! ln -s "$src" "$dst"; then
+    if [ -n "$backup" ]; then
+      mv "$backup/original" "$dst"
+    fi
+    error "Could not link: $dst"
+    return 1
+  fi
   success "Linked: $dst -> $src"
 }
 
 # ── package install wrappers ─────────────────────────────────────────────────
 install_pkg() {
-  # usage: install_pkg <apt|pacman|brew> <package>
+  # usage: install_pkg <package>
   local pkg="$1"
 
   if need_cmd apt-get; then
-    sudo apt-get update -y
+    sudo apt-get update -y || return $?
     sudo apt-get install -y "$pkg"
     return
   fi
@@ -79,21 +92,39 @@ install_tmux() {
 }
 
 install_omz() {
+  local dir="$TARGET_HOME/.oh-my-zsh"
   info "Checking Oh My Zsh..."
-  if [ -d "$HOME/.oh-my-zsh" ]; then
+  if [ -f "$dir/oh-my-zsh.sh" ]; then
     success "Oh My Zsh already installed."
     return
   fi
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    error "Incomplete Oh My Zsh installation: $dir. Move it aside and retry."
+    return 1
+  fi
 
   info "Installing Oh My Zsh..."
-  RUNZSH=no CHSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+  run_install_script https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh \
+    env ZSH="$dir" ZDOTDIR="$TARGET_HOME" RUNZSH=no CHSH=no KEEP_ZSHRC=yes sh || return $?
+  [ -f "$dir/oh-my-zsh.sh" ] || { error "Oh My Zsh installation is incomplete: $dir"; return 1; }
   success "Oh My Zsh installed."
 }
 
+# Download completely before execution; clean up on success and failure.
+run_install_script() (
+  local url="$1" script
+  shift
+  script="$(mktemp)" || return $?
+  trap 'rm -f "$script"' EXIT
+  curl -fsSL "$url" -o "$script" || return $?
+  [ -s "$script" ] || { error "Empty installer: $url"; return 1; }
+  "$@" "$script"
+)
+
 install_p10k() {
-  local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
+  local dir="${ZSH_CUSTOM:-$TARGET_HOME/.oh-my-zsh/custom}/themes/powerlevel10k"
   info "Checking Powerlevel10k..."
-  if [ -d "$dir" ]; then
+  if [ -f "$dir/powerlevel10k.zsh-theme" ]; then
     success "Powerlevel10k already installed."
     return
   fi
@@ -106,10 +137,10 @@ install_zsh_plugin() {
   # usage: install_zsh_plugin <name> <git_url>
   local name="$1"
   local url="$2"
-  local dir="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/$name"
+  local dir="${ZSH_CUSTOM:-$TARGET_HOME/.oh-my-zsh/custom}/plugins/$name"
 
   info "Checking plugin $name..."
-  if [ -d "$dir" ]; then
+  if [ -f "$dir/$name.plugin.zsh" ]; then
     success "$name already installed."
     return
   fi
@@ -120,6 +151,7 @@ install_zsh_plugin() {
 }
 
 install_zoxide() {
+  export PATH="$TARGET_HOME/.local/bin:$PATH"
   info "Checking zoxide..."
   if need_cmd zoxide; then
     success "zoxide: $(zoxide --version)"
@@ -133,7 +165,7 @@ install_zoxide() {
   fi
 
   warn "Package manager install failed; using upstream install script..."
-  curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh
+  run_install_script https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh sh
   if ! need_cmd zoxide; then
     error "zoxide install script finished but zoxide isn't in PATH yet."
     error "Try restarting your shell, or ensure ~/.local/bin is on PATH."
@@ -141,6 +173,18 @@ install_zoxide() {
   fi
   success "zoxide: $(zoxide --version)"
 }
+
+configure_eza_repo() (
+  local tmp
+  tmp="$(mktemp -d)" || return $?
+  trap 'rm -rf "$tmp"' EXIT
+  curl -fsSL https://raw.githubusercontent.com/eza-community/eza/main/deb.asc -o "$tmp/deb.asc" || return $?
+  gpg --batch --dearmor -o "$tmp/gierens.gpg" "$tmp/deb.asc" || return $?
+  printf '%s\n' 'deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main' > "$tmp/gierens.list"
+  sudo install -d -m 755 /etc/apt/keyrings || return $?
+  sudo install -m 644 "$tmp/gierens.gpg" /etc/apt/keyrings/gierens.gpg || return $?
+  sudo install -m 644 "$tmp/gierens.list" /etc/apt/sources.list.d/gierens.list
+)
 
 install_eza() {
   info "Checking eza..."
@@ -154,16 +198,8 @@ install_eza() {
   if need_cmd apt-get; then
     # Debian/Ubuntu: use gierens repo
     sudo apt-get update -y
-    sudo apt-get install -y gpg wget
-
-    sudo mkdir -p /etc/apt/keyrings
-    wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc \
-      | sudo gpg --dearmor -o /etc/apt/keyrings/gierens.gpg
-
-    echo "deb [signed-by=/etc/apt/keyrings/gierens.gpg] http://deb.gierens.de stable main" \
-      | sudo tee /etc/apt/sources.list.d/gierens.list >/dev/null
-
-    sudo chmod 644 /etc/apt/keyrings/gierens.gpg /etc/apt/sources.list.d/gierens.list
+    sudo apt-get install -y gpg
+    configure_eza_repo
 
     sudo apt-get update -y
     sudo apt-get install -y eza
@@ -184,11 +220,16 @@ install_eza() {
 
 # ── deploy dotfiles ──────────────────────────────────────────────────────────
 deploy_configs() {
+  local i
   info "Deploying configs (symlinks)..."
-
-  link "$DOTFILES_DIR/zsh/zshrc"      "$HOME/.zshrc"
-  link "$DOTFILES_DIR/zsh/p10k.zsh"   "$HOME/.p10k.zsh"
-  link "$DOTFILES_DIR/tmux/tmux.conf" "$HOME/.tmux.conf"
+  for i in "${!CONFIG_SOURCES[@]}"; do
+    [ -f "$DOTFILES_DIR/${CONFIG_SOURCES[$i]}" ] || {
+      error "Missing source: ${CONFIG_SOURCES[$i]}"; return 1;
+    }
+  done
+  for i in "${!CONFIG_SOURCES[@]}"; do
+    link "$DOTFILES_DIR/${CONFIG_SOURCES[$i]}" "$TARGET_HOME/${CONFIG_TARGETS[$i]}" || return $?
+  done
 
   success "Configs deployed."
 }
@@ -203,13 +244,14 @@ set_default_shell_to_zsh() {
   fi
 
   info "Changing default shell to zsh (requires password)..."
-  chsh -s "$zsh_path" || warn "chsh failed. You may need to run it manually: chsh -s $zsh_path"
+  if ! chsh -s "$zsh_path"; then
+    error "chsh failed. Run it manually: chsh -s $zsh_path"
+    return 1
+  fi
   success "Default shell set to zsh (effective after re-login)."
 }
 
-main() {
-  info "====== bootstrap Kaito387/dots ======"
-
+install_dependencies() {
   # basic tools for cloning/install scripts
   if ! need_cmd git; then
     error "git is required. Please install git first."
@@ -231,11 +273,81 @@ main() {
   install_zoxide
   install_eza
 
-  deploy_configs
-  set_default_shell_to_zsh
+  check_clipboard
+}
+
+check_clipboard() {
+  if ! need_cmd wl-copy && ! need_cmd xclip && ! need_cmd pbcopy; then
+    warn "System clipboard unavailable: install wl-clipboard (Wayland) or xclip (X11). macOS uses pbcopy."
+  fi
+}
+
+check_configs() {
+  local i cmd dir failed=0
+  for i in "${!CONFIG_SOURCES[@]}"; do
+    if [ -L "$TARGET_HOME/${CONFIG_TARGETS[$i]}" ] &&
+       [ "$TARGET_HOME/${CONFIG_TARGETS[$i]}" -ef "$DOTFILES_DIR/${CONFIG_SOURCES[$i]}" ]; then
+      success "Linked: ${CONFIG_TARGETS[$i]}"
+    else
+      error "Missing or incorrect link: ${CONFIG_TARGETS[$i]}"
+      failed=1
+    fi
+  done
+  for cmd in zsh tmux zoxide eza; do
+    if ! need_cmd "$cmd"; then error "Missing command: $cmd"; failed=1; fi
+  done
+  dir="${ZSH_CUSTOM:-$TARGET_HOME/.oh-my-zsh/custom}"
+  for cmd in "$TARGET_HOME/.oh-my-zsh/oh-my-zsh.sh" \
+    "$dir/themes/powerlevel10k/powerlevel10k.zsh-theme" \
+    "$dir/plugins/zsh-autosuggestions/zsh-autosuggestions.plugin.zsh" \
+    "$dir/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.plugin.zsh"; do
+    if [ ! -f "$cmd" ]; then error "Missing file: $cmd"; failed=1; fi
+  done
+  check_clipboard
+  return "$failed"
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./bootstrap.sh [--install | --link-only | --check] [--chsh]
+  (no mode)    Install dependencies and deploy configs.
+  --install    Install dependencies only.
+  --link-only  Deploy configs only; no downloads or sudo.
+  --check      Check links and dependencies without changing anything.
+  --chsh       Also change the login shell to zsh (explicit opt-in).
+  --help       Show this help.
+EOF
+}
+
+main() {
+  local mode=all change_shell=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --install|--link-only|--check)
+        [ "$mode" = all ] || { error "Choose only one mode."; return 2; }
+        mode="$arg" ;;
+      --chsh) change_shell=1 ;;
+      --help|-h) usage; return ;;
+      *) error "Unknown argument: $arg"; usage; return 2 ;;
+    esac
+  done
+  if [ "$mode" = --check ] && [ "$change_shell" = 1 ]; then
+    error "--check cannot be combined with --chsh."; return 2
+  fi
+  export PATH="$TARGET_HOME/.local/bin:$PATH"
+  info "====== bootstrap Kaito387/dots ======"
+  case "$mode" in
+    all) install_dependencies; deploy_configs ;;
+    --install) install_dependencies ;;
+    --link-only) deploy_configs ;;
+    --check) check_configs; return $? ;;
+  esac
+  if [ "$change_shell" = 1 ]; then set_default_shell_to_zsh; fi
 
   echo ""
   success "Done. Run: exec zsh"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then
+  main "$@"
+fi
