@@ -17,6 +17,30 @@ need_cmd() {
   command -v "$1" &>/dev/null
 }
 
+# User files must be created by their owner; sudo is only used for system packages.
+validate_user_context() {
+  local uid
+  uid="$(id -u)" || return $?
+  TARGET_USER="$(id -un)" || return $?
+  info "Target user: $TARGET_USER (uid $uid); home: $TARGET_HOME"
+  if [ "$uid" = 0 ]; then
+    error "Do not run bootstrap as root or with sudo. It would configure root, not your normal account."
+    error "Log in as the intended user (for example: su - lht), then run ./bootstrap.sh without sudo."
+    return 1
+  fi
+  if [[ "$TARGET_HOME" != /* ]] || [ ! -d "$TARGET_HOME" ] ||
+     [ ! -O "$TARGET_HOME" ] || [ ! -w "$TARGET_HOME" ]; then
+    error "Home directory must exist, be owned by $TARGET_USER, and be writable: $TARGET_HOME"
+    error "Start a login session as the intended user so HOME and permissions are correct."
+    return 1
+  fi
+  if [ -n "${ZDOTDIR:-}" ] && ! [ "$ZDOTDIR" -ef "$TARGET_HOME" ]; then
+    error "ZDOTDIR points outside HOME: $ZDOTDIR. Zsh would not load $TARGET_HOME/.zshrc."
+    error "Unset ZDOTDIR in this login environment before running bootstrap."
+    return 1
+  fi
+}
+
 # ── symlink helper (backup existing) ─────────────────────────────────────────
 link() {
   local src="$1"
@@ -301,8 +325,13 @@ check_configs() {
     "$dir/themes/powerlevel10k/powerlevel10k.zsh-theme" \
     "$dir/plugins/zsh-autosuggestions/zsh-autosuggestions.plugin.zsh" \
     "$dir/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.plugin.zsh"; do
-    if [ ! -f "$cmd" ]; then error "Missing file: $cmd"; failed=1; fi
+    if [ ! -f "$cmd" ] || [ ! -r "$cmd" ]; then error "Missing or unreadable file: $cmd"; failed=1; fi
   done
+  if [ -e "$TARGET_HOME/.zsh_history" ] &&
+     { [ ! -r "$TARGET_HOME/.zsh_history" ] || [ ! -w "$TARGET_HOME/.zsh_history" ]; }; then
+    error "History file is not readable/writable by $TARGET_USER: $TARGET_HOME/.zsh_history"
+    failed=1
+  fi
   check_clipboard
   return "$failed"
 }
@@ -310,6 +339,7 @@ check_configs() {
 usage() {
   cat <<'EOF'
 Usage: ./bootstrap.sh [--install | --link-only | --check] [--chsh]
+Run as the intended normal user, without sudo; root execution is rejected.
   (no mode)    Install dependencies and deploy configs.
   --install    Install dependencies only.
   --link-only  Deploy configs only; no downloads or sudo.
@@ -334,18 +364,32 @@ main() {
   if [ "$mode" = --check ] && [ "$change_shell" = 1 ]; then
     error "--check cannot be combined with --chsh."; return 2
   fi
+  validate_user_context || return $?
   export PATH="$TARGET_HOME/.local/bin:$PATH"
   info "====== bootstrap Kaito387/dots ======"
   case "$mode" in
     all) install_dependencies; deploy_configs ;;
     --install) install_dependencies ;;
     --link-only) deploy_configs ;;
-    --check) check_configs; return $? ;;
+    --check)
+      check_configs || return $?
+      success "Links and dependencies checked for $TARGET_USER ($TARGET_HOME)."
+      info "This does not check the active shell. Run exec zsh to load the configuration."
+      return ;;
   esac
   if [ "$change_shell" = 1 ]; then set_default_shell_to_zsh; fi
 
   echo ""
-  success "Done. Run: exec zsh"
+  if [ "$mode" = --install ]; then
+    success "Dependencies installed for $TARGET_USER. Configs have not been deployed by this run."
+    info "Next: ./bootstrap.sh --link-only"
+  else
+    success "Configs deployed for $TARGET_USER ($TARGET_HOME)."
+    info "In this user's terminal, run: exec zsh"
+    if [ "$change_shell" = 0 ]; then
+      info "The login shell was not changed. To change it: ./bootstrap.sh --link-only --chsh"
+    fi
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" = "$0" ]]; then

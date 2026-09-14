@@ -21,7 +21,14 @@ class BootstrapTests(unittest.TestCase):
         script = f"""
 source {shlex.quote(str(REPO / 'bootstrap.sh'))}
 TARGET_HOME={shlex.quote(str(self.root))}
-unset ZSH_CUSTOM
+unset ZSH_CUSTOM ZDOTDIR
+id() {{
+  case "$1" in
+    -u) echo 1000 ;;
+    -un) echo dots-test ;;
+    *) command id "$@" ;;
+  esac
+}}
 sudo() {{ echo 'Unexpected sudo' >&2; return 97; }}
 curl() {{ echo 'Unexpected curl' >&2; return 97; }}
 git() {{ echo 'Unexpected git' >&2; return 97; }}
@@ -193,6 +200,43 @@ if configure_eza_repo; then exit 99; fi
         for args in ("--check --chsh", "--install --link-only", "--typo"):
             with self.subTest(args=args):
                 self.run_bash("main " + args, expected=2)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_root_is_rejected_before_any_install_or_deploy(self):
+        for mode in ("", "--install", "--link-only", "--check", "--chsh"):
+            with self.subTest(mode=mode):
+                result = self.run_bash('''
+id() { case "$1" in -u) echo 0 ;; -un) echo root ;; esac; }
+export SUDO_USER=lht
+install_dependencies() { touch "$TARGET_HOME/unexpected-install"; }
+main ''' + mode, expected=1)
+                self.assertIn("Do not run bootstrap as root", result.stderr)
+                self.assertNotIn("Configs deployed", result.stdout)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_non_root_with_sudo_environment_can_deploy(self):
+        result = self.run_bash('export SUDO_USER=root\nmain --link-only')
+        self.assertIn("Target user: dots-test (uid 1000)", result.stdout)
+        self.assertIn("The login shell was not changed", result.stdout)
+        self.assertTrue((self.root / ".zshrc").is_symlink())
+
+    def test_non_root_with_missing_home_is_rejected(self):
+        self.run_bash('TARGET_HOME="$TARGET_HOME/missing"\nmain --link-only', expected=1)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    @unittest.skipIf(os.geteuid() == 0, "requires an unprivileged user")
+    def test_non_root_with_foreign_home_is_rejected(self):
+        result = self.run_bash('TARGET_HOME=/root\nmain --link-only', expected=1)
+        self.assertIn("Home directory must", result.stderr)
+
+    def test_redirected_zdotdir_is_rejected_before_deployment(self):
+        result = self.run_bash('export ZDOTDIR="$TARGET_HOME/elsewhere"\nmain --link-only', expected=1)
+        self.assertIn("Zsh would not load", result.stderr)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_help_is_available_as_root(self):
+        result = self.run_bash('id() { echo 0; }\nmain --help')
+        self.assertIn("Usage:", result.stdout)
         self.assertEqual(list(self.root.iterdir()), [])
 
 
